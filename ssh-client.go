@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -13,12 +14,11 @@ import (
 )
 
 type SSHConfig struct {
-	Username       string   `json:"username"`
-	Address        string   `json:"address"`
-	Port           string   `json:"port"`
-	Password       string   `json:"password"`
-	PrivateKeyPath string   `json:"private_key_path"`
-	JumpHosts      []string `json:"jump_hosts"`
+	Username       string     `json:"username"`
+	Address        string     `json:"address"`
+	Password       string     `json:"password"`
+	PrivateKeyPath string     `json:"private_key_path"`
+	JumpHost       *SSHConfig `json:"jump_host"`
 }
 
 func sanitizeSize(width, height int) (int, int) {
@@ -28,6 +28,77 @@ func sanitizeSize(width, height int) (int, int) {
 	return width, height
 }
 
+func buildClientConfig(cfg *SSHConfig) (*ssh.ClientConfig, error) {
+	var authMethods []ssh.AuthMethod
+
+	// Prioritize Private Key if provided
+	if cfg.PrivateKeyPath != "" {
+		key, err := os.ReadFile(cfg.PrivateKeyPath)
+		if err != nil {
+			return nil, fmt.Errorf("unable to read private key: %w", err)
+		}
+		signer, err := ssh.ParsePrivateKey(key)
+		if err != nil {
+			return nil, fmt.Errorf("unable to parse private key: %w", err)
+		}
+		authMethods = append(authMethods, ssh.PublicKeys(signer))
+	} else if cfg.Password != "" {
+		// Fallback to Password Auth
+		authMethods = append(authMethods, ssh.Password(cfg.Password))
+	}
+
+	return &ssh.ClientConfig{
+		User:            cfg.Username,
+		Auth:            authMethods,
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+	}, nil
+}
+
+func dialRecursive(cfg *SSHConfig) (*ssh.Client, error) {
+	sshCfg, err := buildClientConfig(cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	if cfg.JumpHost == nil {
+		return ssh.Dial("tcp", cfg.Address, sshCfg)
+	}
+
+	jumpClient, err := dialRecursive(cfg.JumpHost)
+	if err != nil {
+		return nil, fmt.Errorf("Failed to connect to jump host: %w", err)
+	}
+
+	netConn, err := jumpClient.Dial("tcp", cfg.Address)
+	if err != nil {
+		return nil, fmt.Errorf("failed to route through jump host: %w", err)
+	}
+
+	sshConn, chans, reqs, err := ssh.NewClientConn(netConn, cfg.Address, sshCfg)
+	if err != nil {
+		return nil, fmt.Errorf("failed to establish ssh handshake over jump: %w", err)
+	}
+
+	return ssh.NewClient(sshConn, chans, reqs), nil
+
+}
+
+func loadConfig(filePath string) (*SSHConfig, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open config file: %w", err)
+	}
+	defer file.Close()
+
+	var config SSHConfig
+	decoder := json.NewDecoder(file)
+	if err := decoder.Decode(&config); err != nil {
+		return nil, fmt.Errorf("failed to decode json: %w", err)
+	}
+
+	return &config, nil
+}
+
 func main() {
 	//fmt.Println("Launching custom client")
 
@@ -35,75 +106,22 @@ func main() {
 	if configPath == "" {
 		log.Fatal("SSH_CONFIG_PATH environment variable not set")
 	}
+	// fmt.Printf("Using tmp file: %v\n", configPath)
 
-	// 2. Clean up the environment variable
 	os.Unsetenv("SSH_CONFIG_PATH")
 
-	// 3. Defer the deletion of the file so it is destroyed immediately
-	// after we are done reading, ensuring no credentials linger.
 	defer os.Remove(configPath)
 
-	// 4. Open and decode the file
-	file, err := os.Open(configPath)
+	targetConfig, err := loadConfig(configPath)
 	if err != nil {
-		log.Fatalf("Failed to open config file: %v", err)
-	}
-	defer file.Close()
-
-	var config SSHConfig
-	if err := json.NewDecoder(file).Decode(&config); err != nil {
-		log.Fatalf("Failed to decode configuration: %v", err)
+		log.Fatalf("Configuration error: %v", err)
 	}
 
-	//fdStr := os.Getenv("SSH_CONFIG_FD")
-	//if fdStr == "" {
-	//	log.Fatal("SSH_CONFIG_FD environment variable not set")
-	//}
-	//// Clean up the environment variable immediately so child processes don't see it
-	//os.Unsetenv("SSH_CONFIG_FD")
+	// fmt.Printf("Using Config %v\n", &targetConfig)
 
-	//fdNum, err := strconv.Atoi(fdStr)
-	//if err != nil {
-	//	log.Fatalf("Invalid File Descriptor: %v", err)
-	//}
-
-	//fmt.Printf("File Descriptor: %d", fdNum)
-
-	//// 2. Wrap the raw file descriptor in an os.File
-	//// The name "config_pipe" is arbitrary and just used for internal Go logging
-	//pipeFile := os.NewFile(uintptr(fdNum), "config_pipe")
-	//if pipeFile == nil {
-	//	log.Fatalf("Failed to open pipe file descriptor %d", fdNum)
-	//}
-
-	//// 3. Read and decode the JSON payload
-	//var config SSHConfig
-	//if err := json.NewDecoder(pipeFile).Decode(&config); err != nil {
-	//	pipeFile.Close()
-	//	log.Fatalf("Failed to decode configuration: %v", err)
-	//}
-
-	//// 4. Close the pipe now that we have the data in memory
-	//pipeFile.Close()
-
-	//// 5. Proceed with your SSH connection using `config`!
-
-	//var hostkey ssh.PublicKey
-
-	//fmt.Printf("Successfully loaded config for %s@%s\n", config.Username, config.Address)
-	ssh_config := &ssh.ClientConfig{
-		User: config.Username,
-		Auth: []ssh.AuthMethod{
-			ssh.Password(config.Password),
-		},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-		//HostKeyCallback: ssh.FixedHostKey(hostkey),
-	}
-
-	a_p := config.Address + ":" + config.Port
-	client, err := ssh.Dial("tcp", a_p, ssh_config)
+	client, err := dialRecursive(targetConfig)
 	if err != nil {
-		log.Fatal("Failed to dial: ", err)
+		log.Fatalf("SSH Connection failed: %w", err)
 	}
 
 	defer client.Close()
@@ -115,7 +133,6 @@ func main() {
 		log.Fatal("Failed to put Terminal in raw mode", err)
 	}
 
-	// Ensure we restore the terminal to its normal state on exit
 	defer term.Restore(fd, oldState)
 
 	session, err := client.NewSession()
@@ -156,18 +173,6 @@ func main() {
 	signal.Notify(winch, syscall.SIGWINCH)
 	defer signal.Stop(winch) // Clean up the listener when the session ends
 
-	// Launch a goroutine to handle the resize events in the background
-	//go func() {
-	//	for range winch {
-	//		// Get the new terminal dimensions
-	//		newWidth, newHeight, err := term.GetSize(fd)
-	//		if err == nil {
-	//			// Send the updated dimensions to the remote server
-	//			session.WindowChange(newHeight, newWidth)
-	//		}
-	//	}
-	//}()
-
 	go func() {
 		var timer *time.Timer
 		var timeout <-chan time.Time
@@ -179,8 +184,8 @@ func main() {
 				if timer != nil {
 					timer.Stop()
 				}
-				// Start a 20ms countdown
-				timer = time.NewTimer(20 * time.Millisecond)
+				// Start a 2ms countdown
+				timer = time.NewTimer(2 * time.Millisecond)
 
 				timeout = timer.C
 
