@@ -121,7 +121,7 @@ func main() {
 
 	client, err := dialRecursive(targetConfig)
 	if err != nil {
-		log.Fatalf("SSH Connection failed: %w", err)
+		log.Fatalf("SSH Connection failed: %v", err)
 	}
 
 	defer client.Close()
