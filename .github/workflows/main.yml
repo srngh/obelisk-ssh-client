@@ -5,16 +5,20 @@ name: Go
 
 on:
   push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
 
 jobs:
-
-  build:
+  build-and-release:
+    name: Build and Upload
     runs-on: ubuntu-latest
+
     steps:
-    - uses: actions/checkout@v6
+    - name: Checkout Code
+      uses: actions/checkout@v4
 
     - name: Set up Go
       uses: actions/setup-go@v6
@@ -22,14 +26,16 @@ jobs:
         go-version: '1.26.4'
 
     - name: Build
-      run: go build -v ssh-client.go
+      env:
+        GOOS: linux
+        GOARCH: amd64
+      run: go build -ldflags="-s -w" -o "ssh-client.go" .
 
     - name: Test
       run: go test -v ssh-client.go
       
-    - name: Build and export binary
-      uses: wangyoucao577/go-release-action@v1
+    - name: Upload build fragment
+      uses: softprops/action-gh-release@v2
+      if: startsWith(github.ref, 'refs/tags/')
       with:
-        github_token: ${{ secrets.GITHUB_TOKEN }}
-        goos: linux
-        goarch: amd64
+        files: ssh-client
