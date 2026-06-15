@@ -26,3 +26,10 @@ jobs:
 
     - name: Test
       run: go test -v ssh-client.go
+      
+    - name: Build and export binary
+      uses: wangyoucao577/go-release-action@v1
+      with:
+        github_token: ${{ secrets.GITHUB_TOKEN }}
+        goos: linux
+        goarch: amd64
